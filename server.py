@@ -520,20 +520,29 @@ def get_patient_record():
         
         db = get_db_session()
         patient = db.query(Patient_Profiles).filter(Patient_Profiles.username == patient_username).first()
+        visits = []
         
-        if not patient:
+        if patient:
+            visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id == patient.id).order_by(Patient_Visits.visit_date.desc()).all()
+            
+        if not visits:
              base_name = ''.join([c for c in patient_username if not c.isdigit()])
              if base_name:
-                 patient = db.query(Patient_Profiles).filter(Patient_Profiles.username == base_name).first()
+                 alt_patient = db.query(Patient_Profiles).filter(Patient_Profiles.username == base_name).first()
+                 if alt_patient:
+                     patient = alt_patient
+                     visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id == patient.id).order_by(Patient_Visits.visit_date.desc()).all()
 
-        if not patient:
-             patient = db.query(Patient_Profiles).filter(Patient_Profiles.username.ilike(f"%{patient_username}%")).first()
+        if not visits:
+             alt_patient = db.query(Patient_Profiles).filter(Patient_Profiles.username.ilike(f"%{patient_username}%")).first()
+             if alt_patient:
+                 patient = alt_patient
+                 visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id == patient.id).order_by(Patient_Visits.visit_date.desc()).all()
              
-        if patient:
+        if patient and visits:
             audit = Audit_Log(doctor_id=doctor_id, action='ACCESS_PATIENT_RECORD', patient_id=patient.id)
             db.add(audit)
             db.commit()
-            visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id == patient.id).order_by(Patient_Visits.visit_date.desc()).all()
             records = []
             for visit in visits:
                 records.append({
@@ -574,20 +583,29 @@ def get_patient_risk_trend():
         patient_username = raw_username.strip().lower().replace(" ", "")
         db = get_db_session()
         patient = db.query(Patient_Profiles).filter(Patient_Profiles.username == patient_username).first()
+        visits = []
         
-        if not patient:
+        if patient:
+            visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id == patient.id).order_by(Patient_Visits.visit_date.desc()).limit(5).all()
+            
+        if not visits:
              base_name = ''.join([c for c in patient_username if not c.isdigit()])
              if base_name:
-                 patient = db.query(Patient_Profiles).filter(Patient_Profiles.username == base_name).first()
+                 alt_patient = db.query(Patient_Profiles).filter(Patient_Profiles.username == base_name).first()
+                 if alt_patient:
+                     patient = alt_patient
+                     visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id == patient.id).order_by(Patient_Visits.visit_date.desc()).limit(5).all()
 
-        if not patient:
-             patient = db.query(Patient_Profiles).filter(Patient_Profiles.username.ilike(f"%{patient_username}%")).first()
+        if not visits:
+             alt_patient = db.query(Patient_Profiles).filter(Patient_Profiles.username.ilike(f"%{patient_username}%")).first()
+             if alt_patient:
+                 patient = alt_patient
+                 visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id == patient.id).order_by(Patient_Visits.visit_date.desc()).limit(5).all()
 
-        if patient:
+        if patient and visits:
             audit = Audit_Log(doctor_id=doctor_id, action='ACCESS_RISK_TREND', patient_id=patient.id)
             db.add(audit)
             db.commit()
-            visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id == patient.id).order_by(Patient_Visits.visit_date.desc()).limit(5).all()
             records = [{'prediction_prob': v.prediction_prob, 'visit_date': v.visit_date.isoformat() if v.visit_date else None} for v in visits]
             db.close()
             return jsonify(records), 200
