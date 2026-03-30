@@ -1,0 +1,10 @@
+This is a dummy document for heart disease diet. It should be replaced with a verified medical document.
+
+A heart-healthy diet is low in sodium, saturated fats, and added sugars. It is rich in fruits, vegetables, whole grains, and lean proteins.
+
+- Eat more fruits and vegetables.
+- Choose whole grains like oats, brown rice, and quinoa.
+- Eat fish high in omega-3 fatty acids, like salmon and mackerel.
+- Limit red meat and processed meats.
+- Avoid sugary drinks and snacks.
+- Reduce your sodium intake by cooking at home and avoiding processed foods.

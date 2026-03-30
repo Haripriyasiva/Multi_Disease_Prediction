@@ -1,0 +1,14 @@
+[
+  {
+    "username": "doctor1",
+    "password": "secure123",
+    "role": "DOCTOR",
+    "name": "Dr. Haripriya"
+  },
+  {
+    "username": "patient1",
+    "password": "patient123",
+    "role": "PATIENT",
+    "name": "John Doe"
+  }
+]

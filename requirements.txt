@@ -1,0 +1,17 @@
+pandas
+numpy<2.0.0
+PyJWT
+shap
+faiss-cpu
+sentence-transformers
+flask
+flask-cors
+tensorflow==2.15.0
+keras==2.15.0
+protobuf<4.24
+celery[redis]
+matplotlib
+scikit-learn
+pydantic
+SQLAlchemy==2.0.28
+cryptography
