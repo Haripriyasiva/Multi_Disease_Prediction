@@ -74,6 +74,7 @@ class Patient_Profiles(Base):
     
     visits = relationship("Patient_Visits", back_populates="patient", cascade="all, delete-orphan")
     audits = relationship("Audit_Log", back_populates="patient", cascade="all, delete-orphan")
+    notifications = relationship("Notification", back_populates="patient", cascade="all, delete-orphan")
 
 class Patient_Visits(Base):
     __tablename__ = 'Patient_Visits'
@@ -106,6 +107,16 @@ class Audit_Log(Base):
     patient_id = Column(Integer, ForeignKey('Patient_Profiles.id'))
     
     patient = relationship("Patient_Profiles", back_populates="audits")
+
+class Notification(Base):
+    __tablename__ = 'Notifications'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    patient_id = Column(Integer, ForeignKey('Patient_Profiles.id'), nullable=False)
+    message = Column(String, nullable=False)
+    is_read = Column(Integer, default=0)
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+    
+    patient = relationship("Patient_Profiles", back_populates="notifications")
 
 
 DB_PATH = os.environ.get('DB_PATH', 'medical_data.db')

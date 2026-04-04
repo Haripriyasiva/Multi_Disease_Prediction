@@ -16,6 +16,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from keras.models import load_model
 from celery import Celery
+from celery_worker import schedule_post_prandial_notification
 
 import matplotlib
 matplotlib.use('Agg')
@@ -26,7 +27,7 @@ from sklearn.preprocessing import MinMaxScaler
 from pydantic import BaseModel, Field, ValidationError
 from typing import Optional
 
-from database import init_db, get_db_session, Patient_Profiles, Patient_Visits, Audit_Log
+from database import init_db, get_db_session, Patient_Profiles, Patient_Visits, Audit_Log, Notification
 
 app = Flask(__name__)
 CORS(app)
@@ -52,6 +53,16 @@ celery.conf.update(app.config)
 
 def send_push_notification(patient_username, message):
     print(f"PUSH NOTIFICATION for {patient_username}: {message}")
+    db = get_db_session()
+    try:
+        patient = db.query(Patient_Profiles).filter(Patient_Profiles.username == patient_username).first()
+        if patient:
+            db.add(Notification(patient_id=patient.id, message=message))
+            db.commit()
+    except Exception as e:
+        print(f"Error saving notification to inbox: {e}")
+    finally:
+        db.close()
 
 rag_model = SentenceTransformer('all-MiniLM-L6-v2')
 faiss_index = faiss.read_index("medical_knowledge.index")
@@ -155,20 +166,20 @@ def create_explanation_chart(model, training_features, scaled_patient_vitals, fe
         ref_data = ref_data_scaled[:30] if len(ref_data_scaled) > 30 else ref_data_scaled
         
         for i in range(n_features):
-            deltas = []
-            for _ in range(N_REPEATS):
-                perturbed = scaled_patient_vitals.copy()
-                random_row = rng.integers(0, len(ref_data))
-                perturbed[0, i] = ref_data[random_row, i]
-                perturbed_input = perturbed.reshape(1, 1, n_features)
-                perturbed_pred = float(model.predict(perturbed_input, verbose=0)[0][0])
-                # Magnitude of absolute impact
-                deltas.append(abs(base_pred - perturbed_pred))
+            # Batch permutations for instant parallel prediction
+            perturbed_batch = np.repeat(scaled_patient_vitals, N_REPEATS, axis=0)
+            random_rows = rng.integers(0, len(ref_data), size=N_REPEATS)
+            perturbed_batch[:, i] = ref_data[random_rows, i]
+            
+            perturbed_batch_input = perturbed_batch.reshape(N_REPEATS, 1, n_features)
+            perturbed_preds = model.predict(perturbed_batch_input, verbose=0)
+            
+            deltas = np.abs(base_pred - perturbed_preds[:, 0])
+            mean_impact = float(np.mean(deltas))
             
             # Clinical Color Logic: if patient's value is higher than the dataset mean, it's considered 'High/Abnormal' (Positive/Red)
             is_high_value = scaled_patient_vitals[0, i] > np.mean(ref_data_scaled[:, i])
             
-            mean_impact = float(np.mean(deltas))
             # Assign positive mathematical sign for High values (Red), negative for Normal/Low (Green)
             clinical_shap_value = mean_impact if is_high_value else -mean_impact
             importances.append(clinical_shap_value)
@@ -364,10 +375,8 @@ def predict():
     try:
         decoded_token = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
         patient_username = decoded_token.get('username', 'demo')
-    except jwt.ExpiredSignatureError:
-        return jsonify({'error': 'Token expired'}), 401
-    except jwt.InvalidTokenError:
-        # MODULE 1: Allow demo tokens to pass through
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        # MODULE 1: Allow demo tokens to pass through gracefully
         patient_username = 'doctor1'
     
     try:
@@ -442,7 +451,18 @@ def predict():
         # Save to database
         try:
             db = get_db_session()
+            
+            # MODULE 4: Smart Patient Matching Logic (consistent with get_patient_record)
             patient = db.query(Patient_Profiles).filter(Patient_Profiles.username == patient_username).first()
+            
+            if not patient:
+                base_name = ''.join([c for c in patient_username if not c.isdigit()])
+                if base_name:
+                    patient = db.query(Patient_Profiles).filter(Patient_Profiles.username == base_name).first()
+            
+            if not patient:
+                patient = db.query(Patient_Profiles).filter(Patient_Profiles.username.ilike(f"%{patient_username}%")).first()
+
             if not patient:
                 patient = Patient_Profiles(username=patient_username, name=patient_username.capitalize(), family_history='')
                 db.add(patient)
@@ -465,6 +485,14 @@ def predict():
                 )
                 db.add(new_visit)
                 db.commit()
+                
+                if disease_type == 'Diabetes' and not post_prandial_glucose:
+                    try:
+                        schedule_post_prandial_notification.apply_async(args=[new_visit.id])
+                        print(f"[CELERY] Scheduled 2-hour post-prandial reminder for Visit ID: {new_visit.id}")
+                    except Exception as celery_err:
+                        print(f"[CELERY] Failed to schedule task: {celery_err}")
+                        
             db.close()
         except Exception as db_err:
             print(f"DB save error (non-fatal): {db_err}")
@@ -517,46 +545,41 @@ def get_patient_record():
             return jsonify([]), 200
             
         patient_username = raw_username.strip().lower().replace(" ", "")
-        
         db = get_db_session()
-        patient = db.query(Patient_Profiles).filter(Patient_Profiles.username == patient_username).first()
-        visits = []
         
-        if patient:
-            visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id == patient.id).order_by(Patient_Visits.visit_date.desc()).all()
+        # MODULE 4: Aggregate results from all related profiles (handling varsha vs varsha60)
+        base_name = ''.join([c for c in patient_username if not c.isdigit()])
+        patient_ids = db.query(Patient_Profiles.id).filter(
+            (Patient_Profiles.username == patient_username) |
+            (Patient_Profiles.username == base_name) |
+            (Patient_Profiles.username.ilike(f"%{patient_username}%"))
+        ).all()
+        
+        all_ids = [pid[0] for pid in patient_ids]
+        
+        if all_ids:
+            visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id.in_(all_ids)).order_by(Patient_Visits.visit_date.desc()).all()
             
-        if not visits:
-             base_name = ''.join([c for c in patient_username if not c.isdigit()])
-             if base_name:
-                 alt_patient = db.query(Patient_Profiles).filter(Patient_Profiles.username == base_name).first()
-                 if alt_patient:
-                     patient = alt_patient
-                     visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id == patient.id).order_by(Patient_Visits.visit_date.desc()).all()
-
-        if not visits:
-             alt_patient = db.query(Patient_Profiles).filter(Patient_Profiles.username.ilike(f"%{patient_username}%")).first()
-             if alt_patient:
-                 patient = alt_patient
-                 visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id == patient.id).order_by(Patient_Visits.visit_date.desc()).all()
-             
-        if patient and visits:
-            audit = Audit_Log(doctor_id=doctor_id, action='ACCESS_PATIENT_RECORD', patient_id=patient.id)
-            db.add(audit)
-            db.commit()
-            records = []
-            for visit in visits:
-                records.append({
-                    'id': visit.id, 'visit_date': visit.visit_date.isoformat() if visit.visit_date else None,
-                    'disease_type': visit.disease_type, 'vitals': json.loads(visit.vitals) if visit.vitals else {},
-                    'prediction_prob': visit.prediction_prob, 'clinical_plan': json.loads(visit.clinical_plan) if visit.clinical_plan else {},
-                    'chart_image': visit.chart_image, 'fasting_glucose': visit.fasting_glucose,
-                    'post_prandial_glucose': visit.post_prandial_glucose, 'glucose_delta': visit.glucose_delta, 'hba1c': visit.hba1c
-                })
-            db.close()
-            return jsonify(records), 200
-        else:
-            db.close()
-            return jsonify([]), 200
+            if visits:
+                # Log audit for the first matched patient
+                audit = Audit_Log(doctor_id=doctor_id, action='ACCESS_PATIENT_RECORD', patient_id=all_ids[0])
+                db.add(audit)
+                db.commit()
+                
+                records = []
+                for visit in visits:
+                    records.append({
+                        'id': visit.id, 'visit_date': visit.visit_date.isoformat() if visit.visit_date else None,
+                        'disease_type': visit.disease_type, 'vitals': json.loads(visit.vitals) if visit.vitals else {},
+                        'prediction_prob': visit.prediction_prob, 'clinical_plan': json.loads(visit.clinical_plan) if visit.clinical_plan else {},
+                        'chart_image': visit.chart_image, 'fasting_glucose': visit.fasting_glucose,
+                        'post_prandial_glucose': visit.post_prandial_glucose, 'glucose_delta': visit.glucose_delta, 'hba1c': visit.hba1c
+                    })
+                db.close()
+                return jsonify(records), 200
+        
+        db.close()
+        return jsonify([]), 200
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -582,40 +605,77 @@ def get_patient_risk_trend():
 
         patient_username = raw_username.strip().lower().replace(" ", "")
         db = get_db_session()
-        patient = db.query(Patient_Profiles).filter(Patient_Profiles.username == patient_username).first()
-        visits = []
+
+        base_name = ''.join([c for c in patient_username if not c.isdigit()])
+        patient_ids = db.query(Patient_Profiles.id).filter(
+            (Patient_Profiles.username == patient_username) |
+            (Patient_Profiles.username == base_name) |
+            (Patient_Profiles.username.ilike(f"%{patient_username}%"))
+        ).all()
         
-        if patient:
-            visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id == patient.id).order_by(Patient_Visits.visit_date.desc()).limit(5).all()
+        all_ids = [pid[0] for pid in patient_ids]
+        
+        if all_ids:
+            visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id.in_(all_ids)).order_by(Patient_Visits.visit_date.desc()).limit(5).all()
             
-        if not visits:
-             base_name = ''.join([c for c in patient_username if not c.isdigit()])
-             if base_name:
-                 alt_patient = db.query(Patient_Profiles).filter(Patient_Profiles.username == base_name).first()
-                 if alt_patient:
-                     patient = alt_patient
-                     visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id == patient.id).order_by(Patient_Visits.visit_date.desc()).limit(5).all()
-
-        if not visits:
-             alt_patient = db.query(Patient_Profiles).filter(Patient_Profiles.username.ilike(f"%{patient_username}%")).first()
-             if alt_patient:
-                 patient = alt_patient
-                 visits = db.query(Patient_Visits).filter(Patient_Visits.patient_id == patient.id).order_by(Patient_Visits.visit_date.desc()).limit(5).all()
-
-        if patient and visits:
-            audit = Audit_Log(doctor_id=doctor_id, action='ACCESS_RISK_TREND', patient_id=patient.id)
-            db.add(audit)
-            db.commit()
-            records = [{'prediction_prob': v.prediction_prob, 'visit_date': v.visit_date.isoformat() if v.visit_date else None} for v in visits]
-            db.close()
-            return jsonify(records), 200
-        else:
-            db.close()
-            return jsonify([]), 200
+            if visits:
+                audit = Audit_Log(doctor_id=doctor_id, action='ACCESS_RISK_TREND', patient_id=all_ids[0])
+                db.add(audit)
+                db.commit()
+                records = [{'prediction_prob': v.prediction_prob, 'visit_date': v.visit_date.isoformat() if v.visit_date else None} for v in visits]
+                db.close()
+                return jsonify(records), 200
+        
+        db.close()
+        return jsonify([]), 200
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({'error': 'Invalid Session'}), 401
+
+@app.route('/patient/notifications', methods=['GET'])
+def get_notifications():
+    token = request.headers.get('Authorization')
+    if not token:
+        return jsonify({'error': 'No token provided'}), 401
+    
+    token = token.replace('Bearer ', '').strip()
+    try:
+        decoded_token = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        patient_username = decoded_token.get('username')
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        patient_username = 'doctor1'
+        
+    db = get_db_session()
+    
+    # Aggregated Fuzzy Patient Matching for Notifications
+    base_name = ''.join([c for c in patient_username if not c.isdigit()])
+    patient_ids = db.query(Patient_Profiles.id).filter(
+        (Patient_Profiles.username == patient_username) |
+        (Patient_Profiles.username == base_name) |
+        (Patient_Profiles.username.ilike(f"%{patient_username}%"))
+    ).all()
+    
+    all_ids = [pid[0] for pid in patient_ids]
+    
+    if not all_ids:
+        db.close()
+        return jsonify([])
+        
+    notifications = db.query(Notification).filter(Notification.patient_id.in_(all_ids), Notification.is_read == 0).order_by(Notification.timestamp.desc()).all()
+    results = [{"id": n.id, "message": n.message, "timestamp": n.timestamp.isoformat() if n.timestamp else None} for n in notifications]
+    db.close()
+    return jsonify(results), 200
+
+@app.route('/patient/notifications/<int:notif_id>/read', methods=['POST'])
+def mark_notification_read(notif_id):
+    db = get_db_session()
+    notif = db.query(Notification).filter(Notification.id == notif_id).first()
+    if notif:
+        notif.is_read = 1
+        db.commit()
+    db.close()
+    return jsonify({"success": True}), 200
 
 if __name__ == '__main__':
     init_db()
