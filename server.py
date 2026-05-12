@@ -158,7 +158,8 @@ def create_explanation_chart(model, training_features, scaled_patient_vitals, fe
         
         # Get baseline prediction
         base_input = scaled_patient_vitals.reshape(1, 1, n_features)
-        base_pred = float(model.predict(base_input, verbose=0)[0][0])
+        import tensorflow as tf
+        base_pred = float(tf.constant(model(base_input, training=False)).numpy()[0][0])
         
         # Fast permutation importance — 20 shuffles per feature
         N_REPEATS = 20
@@ -181,7 +182,7 @@ def create_explanation_chart(model, training_features, scaled_patient_vitals, fe
             perturbed_batch[:, i] = ref_data[random_rows, i]
             
             perturbed_batch_input = perturbed_batch.reshape(N_REPEATS, 1, n_features)
-            perturbed_preds = model.predict(perturbed_batch_input, verbose=0)
+            perturbed_preds = tf.constant(model(perturbed_batch_input, training=False)).numpy()
             
             deltas = np.abs(base_pred - perturbed_preds[:, 0])
             mean_impact = float(np.mean(deltas))
@@ -317,7 +318,8 @@ def run_diagnostic(disease_type, vitals_dict):
                 final_input = padded.reshape(1, 1, model_input_shape[2])
                 print(f"Padded input from {expected_features} to {model_input_shape[2]} features")
         
-        prob = float(model.predict(final_input, verbose=0)[0][0])
+        import tensorflow as tf
+        prob = float(tf.constant(model(final_input, training=False)).numpy()[0][0])
         
         # ─── MODULE 3: Hybrid Diagnostic Intelligence (AI + Clinical Safety) ─
         # Combines the neural network's pattern recognition with clinical safety net logic.
