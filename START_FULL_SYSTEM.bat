@@ -1,24 +1,32 @@
 @echo off
 title Medical AI Master Starter
 echo ==================================================
-echo   MEDICAL AI DIAGNOSTIC PLATFORM - MASTER START
+echo   MEDICAL AI DIAGNOSTIC PLATFORM - SYSTEM RESET
 echo ==================================================
 echo.
 
-echo [1/3] Starting REDIS SERVER...
-start "Redis Server" cmd /k "run_redis.bat"
-timeout /t 3 /nobreak > nul
-
-echo [2/3] Starting FLASK BACKEND...
-start "Flask Backend" cmd /k "run_backend.bat"
+echo Cleaning up previous sessions...
+taskkill /f /im python.exe /t >nul 2>&1
+taskkill /f /im node.exe /t >nul 2>&1
+taskkill /f /im redis-server.exe /t >nul 2>&1
 timeout /t 2 /nobreak > nul
 
-echo [3/3] Starting CELERY WORKER...
-start "Celery Worker" cmd /k "run_celery.bat"
+echo [1/4] Launching REDIS SERVER...
+start "Redis Server" cmd /c "run_redis.bat"
+
+echo [2/4] Launching FLASK BACKEND...
+start "Flask Backend" cmd /c "run_backend.bat"
+
+echo [3/4] Launching CELERY WORKER...
+start "Celery Worker" cmd /c "run_celery.bat"
+
+echo [4/4] Launching REACT FRONTEND...
+start "React Frontend" cmd /c "run_frontend.bat"
 
 echo.
 echo ==================================================
-echo   ALL SYSTEMS BOOTED! 
-echo   Please keep all three windows open.
+echo   ALL SYSTEMS TRIGGERED IMMEDIATELY! 
+echo   Windows will open as they become ready.
 echo ==================================================
-pause
+timeout /t 5
+exit

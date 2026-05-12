@@ -1,28 +1,17 @@
-import os
-import io
-import base64
-import datetime
-import pandas as pd
-import numpy as np
-import jwt
-import json
-
-import faiss
-import pickle
-os.environ['TF_USE_LEGACY_KERAS'] = '1'
-from sentence_transformers import SentenceTransformer
-
+# Heavy imports moved inside functions for instant startup
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from keras.models import load_model
 from celery import Celery
 from celery_worker import schedule_post_prandial_notification
+from pydantic import BaseModel, Field, ValidationError
+from typing import Optional
+from database import init_db, get_db_session, Patient_Profiles, Patient_Visits, Audit_Log, Notification
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+# These stay for basic data structures
+import os, io, base64, datetime, json, jwt
+import pandas as pd
+import numpy as np
 
-from sklearn.preprocessing import MinMaxScaler
 
 from pydantic import BaseModel, Field, ValidationError
 from typing import Optional
@@ -30,7 +19,13 @@ from typing import Optional
 from database import init_db, get_db_session, Patient_Profiles, Patient_Visits, Audit_Log, Notification
 
 app = Flask(__name__)
-CORS(app)
+# Enable CORS for all routes and origins
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "healthy", "timestamp": datetime.datetime.utcnow().isoformat()}), 200
+
 
 class Vitals(BaseModel):
     fasting_glucose: int
@@ -64,15 +59,29 @@ def send_push_notification(patient_username, message):
     finally:
         db.close()
 
-rag_model = SentenceTransformer('all-MiniLM-L6-v2')
-faiss_index = faiss.read_index("medical_knowledge.index")
-with open("medical_text_mapping.pkl", "rb") as f:
-    medical_faqs = pickle.load(f)
+# Global cache for loaded models and RAG components
+MODEL_CACHE = {}
+RAG_COMPONENTS = {"model": None, "index": None, "faqs": None}
+
+def get_rag_components():
+    if RAG_COMPONENTS["model"] is None:
+        print("[INIT] Lazy loading RAG components (SentenceTransformer & FAISS)...")
+        import faiss
+        import pickle
+        from sentence_transformers import SentenceTransformer
+        RAG_COMPONENTS["model"] = SentenceTransformer('all-MiniLM-L6-v2')
+        RAG_COMPONENTS["index"] = faiss.read_index("medical_knowledge.index")
+        with open("medical_text_mapping.pkl", "rb") as f:
+            RAG_COMPONENTS["faqs"] = pickle.load(f)
+    return RAG_COMPONENTS["model"], RAG_COMPONENTS["index"], RAG_COMPONENTS["faqs"]
+
 
 def retrieve_medical_advice(user_query):
-    query_vector = rag_model.encode([user_query]).astype("float32")
-    distances, indices = faiss_index.search(query_vector, 3)
-    results = [medical_faqs[i] for i in indices[0]]
+    model, index, faqs = get_rag_components()
+    query_vector = model.encode([user_query]).astype("float32")
+    distances, indices = index.search(query_vector, 3)
+    results = [faqs[i] for i in indices[0]]
+
     guardrail = " I cannot prescribe medication or dosages. Always consult your doctor."
     return " ".join(results) + guardrail
 
@@ -177,17 +186,30 @@ def create_explanation_chart(model, training_features, scaled_patient_vitals, fe
             deltas = np.abs(base_pred - perturbed_preds[:, 0])
             mean_impact = float(np.mean(deltas))
             
-            # Clinical Color Logic: if patient's value is higher than the dataset mean, it's considered 'High/Abnormal' (Positive/Red)
-            is_high_value = scaled_patient_vitals[0, i] > np.mean(ref_data_scaled[:, i])
+            # ─── MODULE 3: Clinical Color Logic (Danger-Aware) ───────────
+            # High is bad for most, but Low is bad for Hemo, Thalach, PCV, RC
+            low_is_bad = ['hemo', 'thalach', 'pcv', 'rc']
+            is_low_bad_feature = any(name.lower() in low_is_bad for name in [feature_names[i]])
             
-            # Assign positive mathematical sign for High values (Red), negative for Normal/Low (Green)
-            clinical_shap_value = mean_impact if is_high_value else -mean_impact
+            mean_val = np.mean(ref_data_scaled[:, i])
+            current_val = scaled_patient_vitals[0, i]
+            
+            # A value is 'dangerous' (Red) if it's High when High-is-Bad, OR Low when Low-is-Bad
+            if is_low_bad_feature:
+                is_dangerous = current_val < mean_val
+            else:
+                is_dangerous = current_val > mean_val
+                
+            # Assign positive for Dangerous (Red), negative for Safe (Green)
+            clinical_shap_value = mean_impact if is_dangerous else -mean_impact
             importances.append(clinical_shap_value)
 
-        # Sort by absolute importance magnitude
-        sorted_idx = np.argsort(np.abs(importances))[::-1]
+
+        # Sort: Warnings (Positive/Red) first, then by absolute magnitude
+        sorted_idx = sorted(range(n_features), key=lambda i: (importances[i] >= 0, abs(importances[i])), reverse=True)
         sorted_features = [feature_names[i] for i in sorted_idx]
         sorted_values = [importances[i] for i in sorted_idx]
+
 
         # Build structured data for frontend Chart.js
         shap_data = {
@@ -196,7 +218,12 @@ def create_explanation_chart(model, training_features, scaled_patient_vitals, fe
         }
 
         # Build waterfall-style matplotlib chart
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        
         colors = ['#DC2626' if v >= 0 else '#10B981' for v in sorted_values]
+
         fig, ax = plt.subplots(figsize=(8, 5))
         y_pos = range(len(sorted_features))
         bars = ax.barh(list(y_pos), sorted_values, color=colors, edgecolor='white', linewidth=0.5)
@@ -241,8 +268,17 @@ def run_diagnostic(disease_type, vitals_dict):
         if not os.path.exists(model_path) or not os.path.exists(dataset_path):
             return 0.0, "", None, {"meds":"Missing Data","treatment":"N/A","diet":"N/A"}
             
-        model = load_model(model_path)
+        # MODULE 3: Cached Model Loading - avoids reloading 50MB+ models from disk on every click
+        if disease_type not in MODEL_CACHE:
+            print(f"[CACHE] Loading {disease_type} model into memory...")
+            from keras.models import load_model
+            MODEL_CACHE[disease_type] = load_model(model_path)
+        
+        model = MODEL_CACHE[disease_type]
+        
+        from sklearn.preprocessing import MinMaxScaler
         training_data = pd.read_csv(dataset_path)
+
         for feature in config["features"]:
             if feature in training_data.columns:
                 training_data[feature] = pd.to_numeric(training_data[feature], errors='coerce')
@@ -283,11 +319,97 @@ def run_diagnostic(disease_type, vitals_dict):
         
         prob = float(model.predict(final_input, verbose=0)[0][0])
         
-        # Critical Clinical Safety Net (Overrides raw dataset bias)
+        # ─── MODULE 3: Hybrid Diagnostic Intelligence (AI + Clinical Safety) ─
+        # Combines the neural network's pattern recognition with clinical safety net logic.
+        
+        clinical_safety_score = 0.0
+        is_critical = False
+        
         if disease_type == 'Kidney':
             hemo = to_float(vitals_dict.get('hemo'))
-            if hemo > 0 and hemo < 10.0:
-                prob = max(prob, 0.95)  # Severe anemia guarantees high risk
+            sc = to_float(vitals_dict.get('sc'))
+            al = to_float(vitals_dict.get('al'))
+            htn = to_float(vitals_dict.get('htn'))
+            bu = to_float(vitals_dict.get('bu'))
+            
+            # Weighted Clinical Risks
+            if 0 < hemo < 7.0: clinical_safety_score = max(clinical_safety_score, 0.95); is_critical = True
+            elif 7.0 <= hemo < 10.0: clinical_safety_score = max(clinical_safety_score, 0.85)
+            
+            if sc > 3.0: clinical_safety_score = max(clinical_safety_score, 0.98); is_critical = True
+            elif sc > 1.5: clinical_safety_score = max(clinical_safety_score, 0.82)
+            
+            if al >= 2: clinical_safety_score = max(clinical_safety_score, 0.85)
+            if bu > 100: clinical_safety_score = max(clinical_safety_score, 0.96); is_critical = True
+            elif bu > 40: clinical_safety_score = max(clinical_safety_score, 0.75)
+            
+            if htn >= 1: clinical_safety_score = max(clinical_safety_score, 0.65)
+            
+            # Healthy State Suppression
+            if sc <= 1.2 and hemo >= 13.0 and al == 0 and htn == 0:
+                prob = min(prob, 0.12)
+                clinical_safety_score = 0.0
+                is_critical = False
+        
+        elif disease_type == 'Heart':
+            thalach = to_float(vitals_dict.get('thalach'))
+            chol = to_float(vitals_dict.get('chol'))
+            ca = to_float(vitals_dict.get('ca'))
+            oldpeak = to_float(vitals_dict.get('oldpeak'))
+            age = to_float(vitals_dict.get('Age'))
+            cp = to_float(vitals_dict.get('cp'))
+            
+            if thalach > 195 or thalach < 40: clinical_safety_score = max(clinical_safety_score, 0.95); is_critical = True
+            if chol > 450: clinical_safety_score = max(clinical_safety_score, 0.92); is_critical = True
+            elif chol > 300: clinical_safety_score = max(clinical_safety_score, 0.80)
+            
+            if ca >= 3: clinical_safety_score = max(clinical_safety_score, 0.88); is_critical = True
+            if oldpeak > 3.5: clinical_safety_score = max(clinical_safety_score, 0.94); is_critical = True
+            
+            # Healthy State Suppression
+            if age < 55 and chol < 210 and thalach < 165 and cp == 0:
+                prob = min(prob, 0.08)
+                clinical_safety_score = 0.0
+                is_critical = False
+
+        elif disease_type == 'Diabetes':
+            glucose = to_float(vitals_dict.get('Glucose'))
+            bmi = to_float(vitals_dict.get('BMI'))
+            hba1c = to_float(vitals_dict.get('hba1c'))
+            
+            if glucose > 250: clinical_safety_score = max(clinical_safety_score, 0.96); is_critical = True
+            elif glucose > 180: clinical_safety_score = max(clinical_safety_score, 0.85)
+            
+            if hba1c > 10.0: clinical_safety_score = max(clinical_safety_score, 0.94); is_critical = True
+            elif hba1c > 8.0: clinical_safety_score = max(clinical_safety_score, 0.82)
+            
+            if bmi > 48: clinical_safety_score = max(clinical_safety_score, 0.90); is_critical = True
+            
+            # Healthy State Suppression
+            if glucose < 95 and hba1c < 5.5 and bmi < 24:
+                prob = min(prob, 0.05)
+                clinical_safety_score = 0.0
+                is_critical = False
+
+        # FINAL HYBRID SCORE: Weighted AI + Clinical Risk
+        if clinical_safety_score > 0:
+            if is_critical:
+                # Critical escalation: Clinical score dominates for safety
+                prob = (prob * 0.1) + (clinical_safety_score * 0.9)
+            elif sc <= 1.2 and al == 0 and htn == 0:
+                # Strong healthy protection
+                prob = (prob * 0.8) + (clinical_safety_score * 0.2)
+                prob = min(prob, 0.40) 
+            else:
+                # Balanced hybrid
+                prob = (prob * 0.4) + (clinical_safety_score * 0.6)
+        
+        prob = round(prob, 3)
+
+
+
+
+
         
         clinical_plan = get_clinical_advice(disease_type, prob, config['threshold'])
         chart_base64, shap_data = create_explanation_chart(model, training_data[config["features"]], scaled_vitals, config["features"])
@@ -679,4 +801,6 @@ def mark_notification_read(notif_id):
 
 if __name__ == '__main__':
     init_db()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # Use threaded=True for immediate startup without double-loading of models
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+
